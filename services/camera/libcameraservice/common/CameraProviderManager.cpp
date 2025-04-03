@@ -55,6 +55,11 @@
 #include "device3/ZoomRatioMapper.h"
 #include "utils/Utils.h"
 
+#include <cstdlib>
+#include "android-base/file.h"
+#include "android-base/stringprintf.h"
+#include "android-base/strings.h"
+
 namespace android {
 
 using namespace ::android::hardware::camera;
@@ -64,6 +69,10 @@ using namespace camera3::SessionConfigurationUtils;
 using std::literals::chrono_literals::operator""s;
 using hardware::camera2::utils::CameraIdAndSessionConfiguration;
 using hardware::camera2::params::OutputConfiguration;
+
+using ::android::base::Split;
+using ::android::base::StringPrintf;
+using ::android::base::WriteStringToFile;
 
 namespace flags = com::android::internal::camera::flags;
 namespace vd_flags = android::companion::virtualdevice::flags;
@@ -82,6 +91,60 @@ const bool CameraProviderManager::kFrameworkHeicUltraHDRDisabled =
     property_get_bool("ro.camera.disableHeicUltraHDR", false);
 const bool CameraProviderManager::kFrameworkHeicAllowSWCodecs =
     property_get_bool("ro.camera.enableSWHEVC", false);
+
+static LegacyTorchStrength* parseLegacyTorchStrengthConfig() {
+    char config[PROPERTY_VALUE_MAX];
+    property_get("ro.vendor.camera.legacy_torch_strength_config", config, "");
+    if (strlen(config) == 0) {
+        ALOGW("%s: Failed to get property, maybe not set", __FUNCTION__);
+        return nullptr;
+    }
+    
+    auto split = Split(config, "|");
+    if (split.size() != 4 && split.size() != 5) {
+        ALOGE("%s: Invalid legacy torch strength config: %s", __FUNCTION__, config);
+        return nullptr;
+    }
+
+    std::string cameraId = split[0];
+    std::string configPath = split[1];
+    int32_t defaultStrength = strtol(split[2].c_str(), NULL, 10);
+    int32_t maxStrength = strtol(split[3].c_str(), NULL, 10);
+    int32_t stepCount = split.size() == 5 ? strtol(split[4].c_str(), NULL, 10) : 0;
+
+    if (defaultStrength <= 1 || maxStrength <= 1 || stepCount < 0) {
+        ALOGW("%s: Invalid strength from %s", __FUNCTION__, config);
+        return nullptr;
+    }
+
+    return new LegacyTorchStrength(cameraId, configPath, defaultStrength, maxStrength, stepCount);
+}
+
+const LegacyTorchStrength* CameraProviderManager::kLegacyTorchStrength = parseLegacyTorchStrengthConfig();
+
+status_t CameraProviderManager::writeLegacyTorchStrengthLevel(ProviderInfo::DeviceInfo* deviceInfo,
+    int32_t torchStrength) {
+    if (deviceInfo == nullptr || kLegacyTorchStrength == nullptr) {
+        return INVALID_OPERATION;
+    }
+
+    if (torchStrength < 1 || torchStrength > kLegacyTorchStrength->maxStrength) {
+        ALOGE("%s: Invalid torch strength %d, should be between 1 and %d", __FUNCTION__,
+                torchStrength, kLegacyTorchStrength->maxStrength);
+        return BAD_VALUE;
+    }
+
+    if (!WriteStringToFile(StringPrintf("%d", torchStrength), kLegacyTorchStrength->configPath)) {
+        ALOGE("%s: Failed to write %s", __FUNCTION__,
+                kLegacyTorchStrength->configPath.c_str());
+        return PERMISSION_DENIED;
+    }
+
+    ALOGI("%s: Successfully write %s %d", __FUNCTION__,
+            kLegacyTorchStrength->configPath.c_str(), torchStrength);
+    deviceInfo->mTorchStrengthLevel = torchStrength;
+    return OK;
+}
 
 CameraProviderManager::HidlServiceInteractionProxyImpl
 CameraProviderManager::sHidlServiceInteractionProxy{};
@@ -554,6 +617,15 @@ status_t CameraProviderManager::getTorchStrengthLevel(const std::string &id,
     auto deviceInfo = findDeviceInfoLocked(id);
     if (deviceInfo == nullptr) return NAME_NOT_FOUND;
 
+    if (kLegacyTorchStrength != nullptr && id == kLegacyTorchStrength->cameraId) {
+        ALOGI("%s: legacyTorchStrength: Getting torch strength", __FUNCTION__);
+
+        *torchStrength = deviceInfo->mTorchStrengthLevel != 0
+            ? deviceInfo->mTorchStrengthLevel
+            : deviceInfo->mTorchDefaultStrengthLevel;
+        return OK;
+    }
+
     return deviceInfo->getTorchStrengthLevel(torchStrength);
 }
 
@@ -563,6 +635,67 @@ status_t CameraProviderManager::turnOnTorchWithStrengthLevel(const std::string &
 
     auto deviceInfo = findDeviceInfoLocked(id);
     if (deviceInfo == nullptr) return NAME_NOT_FOUND;
+
+    if (kLegacyTorchStrength != nullptr && id == kLegacyTorchStrength->cameraId) {
+        int32_t current = deviceInfo->mTorchStrengthLevel != 0 
+            ? deviceInfo->mTorchStrengthLevel
+            : deviceInfo->mTorchDefaultStrengthLevel;
+        // Update only if the brightness change crosses a step boundary.
+        bool shouldUpdate = kLegacyTorchStrength->stepCount == 0;
+        if (!shouldUpdate) {
+            int32_t stepSize = kLegacyTorchStrength->maxStrength / kLegacyTorchStrength->stepCount;
+
+            int32_t currentStep = current / stepSize;
+            int32_t newStep = torchStrength / stepSize;
+
+            shouldUpdate = currentStep != newStep;
+        }
+
+        // Pass the camera ID to start interface so that it will save it to the map of ICameraProviders
+        // that are currently in use.
+        sp<ProviderInfo> parentProvider = deviceInfo->mParentProvider.promote();
+        if (parentProvider == nullptr) {
+            return DEAD_OBJECT;
+        }
+        std::shared_ptr<HalCameraProvider> halCameraProvider = nullptr;
+        IPCTransport providerTransport = parentProvider->getIPCTransport();
+        status_t res = OK;
+        if (providerTransport == IPCTransport::HIDL) {
+            res = setTorchModeT<HidlProviderInfo, HidlHalCameraProvider>(parentProvider,
+                    &halCameraProvider);
+            if (res != OK) {
+                return res;
+            }
+        } else if (providerTransport == IPCTransport::AIDL) {
+            res = setTorchModeT<AidlProviderInfo, AidlHalCameraProvider>(parentProvider,
+                    &halCameraProvider);
+            if (res != OK) {
+                return res;
+            }
+        } else {
+            ALOGE("%s Invalid provider transport", __FUNCTION__);
+            return INVALID_OPERATION;
+        }
+        saveRef(DeviceMode::TORCH, deviceInfo->mId, halCameraProvider);
+
+        if (shouldUpdate) {
+            status_t res = deviceInfo->setTorchMode(false);
+            if (res != OK) {
+                return res;
+            }
+
+            res = writeLegacyTorchStrengthLevel(deviceInfo, torchStrength);
+            if (res != OK) {
+                return res;
+            }
+        } else {
+            ALOGD("%s: legacyTorchStrength: Skipping strength level updates: "
+                "prev_level: %d, new_level: %d, max: %d", __FUNCTION__,
+                current, torchStrength, deviceInfo->mTorchMaximumStrengthLevel);
+        }
+
+        return deviceInfo->setTorchMode(true);
+    }
 
     return deviceInfo->turnOnTorchWithStrengthLevel(torchStrength);
 }
@@ -651,6 +784,15 @@ status_t CameraProviderManager::setTorchMode(const std::string &id, bool enabled
         return INVALID_OPERATION;
     }
     saveRef(DeviceMode::TORCH, deviceInfo->mId, halCameraProvider);
+
+    if (!enabled && kLegacyTorchStrength != nullptr && id == kLegacyTorchStrength->cameraId) {
+        ALOGI("%s: legacyTorchStrength: Restoring default torch strength", __FUNCTION__);
+
+        status_t res = writeLegacyTorchStrengthLevel(deviceInfo, deviceInfo->mTorchDefaultStrengthLevel);
+        if (res != OK) {
+            return res;
+        }
+    }
 
     return deviceInfo->setTorchMode(enabled);
 }
@@ -1718,6 +1860,13 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupTorchStrengthTag
     auto flashInfoStrengthDefaultLevelEntry = c.find(ANDROID_FLASH_INFO_STRENGTH_DEFAULT_LEVEL);
     if (flashInfoStrengthDefaultLevelEntry.count == 0) {
         int32_t flashInfoStrengthDefaultLevel = 1;
+
+        if (kLegacyTorchStrength != nullptr && mId == kLegacyTorchStrength->cameraId) {
+            ALOGI("%s: legacyTorchStrength: Updating default torch strength %d for cameraId %s",
+                __FUNCTION__,  kLegacyTorchStrength->defaultStrength, mId.c_str());
+            flashInfoStrengthDefaultLevel = kLegacyTorchStrength->defaultStrength;
+        }
+
         res = c.update(ANDROID_FLASH_INFO_STRENGTH_DEFAULT_LEVEL,
                 &flashInfoStrengthDefaultLevel, 1);
         if (res != OK) {
@@ -1729,6 +1878,13 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::fixupTorchStrengthTag
     auto flashInfoStrengthMaximumLevelEntry = c.find(ANDROID_FLASH_INFO_STRENGTH_MAXIMUM_LEVEL);
     if (flashInfoStrengthMaximumLevelEntry.count == 0) {
         int32_t flashInfoStrengthMaximumLevel = 1;
+
+        if (kLegacyTorchStrength != nullptr && mId == kLegacyTorchStrength->cameraId) {
+            ALOGI("%s: legacyTorchStrength: Updating max torch strength %d for cameraId %s",
+                __FUNCTION__, kLegacyTorchStrength->maxStrength, mId.c_str());
+            flashInfoStrengthMaximumLevel = kLegacyTorchStrength->maxStrength;
+        }
+
         res = c.update(ANDROID_FLASH_INFO_STRENGTH_MAXIMUM_LEVEL,
                 &flashInfoStrengthMaximumLevel, 1);
         if (res != OK) {
