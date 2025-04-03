@@ -48,6 +48,14 @@ namespace android {
 
 using hardware::camera2::utils::CameraIdAndSessionConfiguration;
 
+struct LegacyTorchStrength {
+  const std::string cameraId;
+  const std::string configPath;
+  int32_t defaultStrength;
+  int32_t maxStrength;
+  int32_t stepCount;
+};
+
 enum class CameraDeviceStatus : uint32_t {
   NOT_PRESENT = 0,
   PRESENT = 1,
@@ -964,6 +972,9 @@ private:
     status_t usbDeviceDetached(const std::string &usbDeviceId);
 
     static bool isVirtualCameraHalEnabled();
+
+    static const LegacyTorchStrength* kLegacyTorchStrength;
+    status_t writeLegacyTorchStrengthLevel(ProviderInfo::DeviceInfo* deviceInfo, int32_t torchStrength);
 };
 
 } // namespace android
